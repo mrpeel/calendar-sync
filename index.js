@@ -2,11 +2,15 @@ const pMap = require("p-map")
 const delay = require("delay")
 const { google } = require("googleapis");
 const h2p = require('html2plaintext');
-
+const aws = require('aws-sdk');
 
 if (process.env.NODE_ENV !== "production") {
     require("dotenv").config();
 }
+
+const lambda = new aws.Lambda({
+    region: 'ap-southeast-2',
+});
 
 const randomDelay = () => {
     const ms = Math.floor(Math.random() * 10000);
@@ -38,6 +42,7 @@ const getGcalEvents = async (gCal, minDate, maxDate, maxNumEvents) => {
         timeMax: maxDate.toISOString(),
         maxResults: maxNumEvents,
         calendarId: process.env.GOOGLE_CALENDAR_ID,
+        singleEvents: true,
     };
     const events = await gCal.events.list(params);
     return events.data.items;
@@ -119,7 +124,7 @@ const importGCalEvents = async (gCal, outlookEvents) => {
                 end: {
                 },
                 summary: event.Subject,
-                description: h2p(event.Body),
+                description: event.Body,
                 location: event.Location
             }
         };
@@ -165,55 +170,11 @@ const processCalendars = async (outlookEvents) => {
 };
 
 
-let syncHandler = async (event, context, callback) => {
-    try {
-        const requireds = [
-            'GOOGLE_CALENDAR_ID',
-            'GOOGLE_APPLICATION_CREDENTIALS_BASE64',
-            'MAX_NUM_EVENTS',
-        ];
-
-        const hasEnv = requireds.every(env => env in process.env)
-        if (!hasEnv) {
-            throw new Error(`missing required env vars: ${requireds}`);
-        }
-
-        let incomingEventJson = JSON.parse(event.body)
-
-        if (incomingEventJson.events) {
-            console.log(`Received ${incomingEventJson.events.length} calendar events for processing...`);
-            callback(null, {
-                statusCode: 200,
-                body: JSON.stringify({
-                    message: "Processing initiated"
-                })
-            });
-            await processCalendars(incomingEventJson.events);
-        } else {
-            console.log(`No events received.  Nothing to process.`);
-            callback(null, {
-                statusCode: 200,
-                body: JSON.stringify({
-                    message: "No records to process"
-                })
-            });
-        }
-        console.log(`Finished processing`);
-
-        context.succeed();
-    } catch (err) {
-        console.log(err);
-        callback(null, {
-            statusCode: 500,
-        });
-        context.fail();
-    }
-};
-
 const retrieveGoogleEvent = async (gCal, id) => {
     const params = {
         iCalUID: id,
         calendarId: process.env.GOOGLE_CALENDAR_ID,
+        singleEvents: true,
     };
     const events = await gCal.events.list(params);
     let returnVal;
@@ -235,7 +196,7 @@ const importSingleEvent = async (gCal, event) => {
             end: {
             },
             summary: event.Subject,
-            description: h2p(event.Body),
+            description: event.Body,
             location: event.Location,
         }
     };
@@ -288,7 +249,7 @@ let eventHandler = async (event, context, callback) => {
         incomingEventJson.Organizer = incomingEventJson.Organizer || incomingEventJson.organizer;
         incomingEventJson.RequiredAttendees = incomingEventJson.RequiredAttendees || incomingEventJson.requiredAttendees;
         incomingEventJson.Subject = incomingEventJson.Subject || incomingEventJson.subject;
-        incomingEventJson.Body = incomingEventJson.Body || incomingEventJson.body;
+        incomingEventJson.Body = h2p(incomingEventJson.Body || incomingEventJson.body || '');
         incomingEventJson.Location = incomingEventJson.Location || incomingEventJson.location;
         incomingEventJson.Start = incomingEventJson.Start || incomingEventJson.start;
         incomingEventJson.End = incomingEventJson.End || incomingEventJson.end;
@@ -341,9 +302,128 @@ let eventHandler = async (event, context, callback) => {
     }
 };
 
+let syncHandler = async (event, context, callback) => {
+    try {
+        const requireds = [
+            'GOOGLE_CALENDAR_ID',
+            'GOOGLE_APPLICATION_CREDENTIALS_BASE64',
+            'MAX_NUM_EVENTS',
+        ];
+
+        const hasEnv = requireds.every(env => env in process.env)
+        if (!hasEnv) {
+            throw new Error(`missing required env vars: ${requireds}`);
+        }
+
+        let incomingEventJson = JSON.parse(event.body)
+
+        if (incomingEventJson.events) {
+            console.log(`Received ${incomingEventJson.events.length} calendar events for processing...`);
+            callback(null, {
+                statusCode: 200,
+                body: JSON.stringify({
+                    message: "Processing initiated"
+                })
+            });
+            await processCalendars(incomingEventJson.events);
+        } else {
+            console.log(`No events received.  Nothing to process.`);
+            callback(null, {
+                statusCode: 200,
+                body: JSON.stringify({
+                    message: "No records to process"
+                })
+            });
+        }
+        console.log(`Finished processing`);
+
+        context.succeed();
+    } catch (err) {
+        console.log(err);
+        callback(null, {
+            statusCode: 500,
+        });
+        context.fail();
+    }
+};
+
+let invokeLambda = function (lambdaName, event) {
+    return new Promise(function (resolve, reject) {
+        lambda.invoke({
+            FunctionName: lambdaName,
+            InvocationType: 'Event',
+            Payload: JSON.stringify(event, null, 2),
+        }, function (err, data) {
+            if (err) {
+                reject(err);
+            } else {
+                console.log(`Function ${lambdaName} executed`);
+                resolve(true);
+            }
+        });
+    });
+};
+
+/*
+    Receieve the sync payload, reduce its size, then call start the lambda to process the payload. 
+    This allows the API to return within 30 seconds to fix timeouts errors.
+*/
+let apiHandler = async (event, context, callback) => {
+    try {
+        let incomingEvents = JSON.parse(event.body)
+
+        /*
+            Events use either camel case or Pascal case depending on which version of the event trigger is used
+            in MS flow.  Each of the uses of a property attempts to use whichever version was supplied.
+            Work through the events, an create new versions which only contain the required properties.
+        */
+        let newEvents = [];
+
+        incomingEvents.events.forEach(existingEvent => {
+            newEvents.push({
+                Id: existingEvent.Id || existingEvent.id,
+                Organizer: existingEvent.Organizer || existingEvent.organizer,
+                RequiredAttendees: existingEvent.RequiredAttendees || existingEvent.requiredAttendees,
+                Subject: existingEvent.Subject || existingEvent.subject,
+                Body: h2p(existingEvent.Body || existingEvent.body || ''),
+                Location: existingEvent.Location || existingEvent.location,
+                Start: existingEvent.Start || existingEvent.start,
+                End: existingEvent.End || existingEvent.end,
+            });
+        });
+
+        // Overwrite the event body with the updated events
+        event.body = JSON.stringify({
+            events: newEvents,
+        });
+
+        await invokeLambda('googleCalendarSync', event);
+
+        console.log('googleCalendarSync successfully invoked');
+        callback(null, {
+            statusCode: 200,
+            body: JSON.stringify({
+                message: "googleCalendarSync successfully invoked"
+            })
+        });
+
+        context.succeed();
+    } catch (err) {
+        console.log(`Error ${err}.  Execution failed`);
+        callback(null, {
+            statusCode: 400,
+            body: JSON.stringify({
+                message: "Executing googleCalendarSync failed"
+            })
+        });
+        context.fail('Executing googleCalendarSync failed.  ', err);
+    }
+}
+
 module.exports = {
     syncHandler: syncHandler,
     eventHandler: eventHandler,
+    apiHandler: apiHandler,
 };
 
 
